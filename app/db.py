@@ -1,4 +1,12 @@
-"""SQLite persistence: sessions (with received bitmap) and per-chunk digests."""
+"""SQLite persistence: sessions (with received bitmap), per-chunk digests and
+committed byte segments.
+
+The ``bitmap`` column on ``sessions`` records, per logical chunk, whether that
+chunk's byte interval is *fully covered* by confirmed chunks and/or committed
+segments.  The ``segments`` table is created with ``CREATE TABLE IF NOT
+EXISTS`` so pre-existing databases are migrated in place: old sessions,
+chunks and bitmaps are kept untouched and simply have no segment rows.
+"""
 
 from __future__ import annotations
 
@@ -31,6 +39,19 @@ CREATE TABLE IF NOT EXISTS chunks (
     PRIMARY KEY (session_id, chunk_index),
     FOREIGN KEY (session_id) REFERENCES sessions (session_id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS segments (
+    session_id  TEXT NOT NULL,
+    seg_id      TEXT NOT NULL,
+    start_off   INTEGER NOT NULL,
+    end_off     INTEGER NOT NULL,
+    size        INTEGER NOT NULL,
+    sha256      TEXT NOT NULL,
+    path        TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, seg_id),
+    FOREIGN KEY (session_id) REFERENCES sessions (session_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_segments_span ON segments (session_id, start_off, end_off);
 """
 
 
@@ -87,14 +108,25 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def insert_chunk_with_bitmap(self, rec: dict, bitmap: bytes) -> None:
-        """Record a confirmed chunk and flip its bitmap bit in one transaction."""
+    def insert_chunk_with_bitmap(self, rec: dict, bitmap: bytes, remove_segment_ids: list[str] | None = None) -> None:
+        """Record a confirmed chunk and flip its bitmap bit in one transaction.
+
+        ``remove_segment_ids`` lists byte segments that the chunk fully
+        contains; their rows are dropped in the same transaction so coverage
+        is conserved atomically (their files are unlinked by the caller after
+        commit, and by ``reconcile`` if the process dies in between).
+        """
         with self.lock, self._conn:
             self._conn.execute(
                 "INSERT INTO chunks (session_id, chunk_index, size, sha256, path, received_at)"
                 " VALUES (:session_id, :chunk_index, :size, :sha256, :path, :received_at)",
                 rec,
             )
+            for seg_id in remove_segment_ids or []:
+                self._conn.execute(
+                    "DELETE FROM segments WHERE session_id = ? AND seg_id = ?",
+                    (rec["session_id"], seg_id),
+                )
             self._conn.execute(
                 "UPDATE sessions SET bitmap = ? WHERE session_id = ?",
                 (bitmap, rec["session_id"]),
@@ -111,6 +143,39 @@ class Database:
         with self.lock, self._conn:
             self._conn.execute(
                 "UPDATE sessions SET bitmap = ? WHERE session_id = ?", (bitmap, session_id)
+            )
+
+    # ---- byte segments (arbitrary-range resume) ----
+
+    def list_segments(self, session_id: str) -> list[dict]:
+        with self.lock:
+            rows = self._conn.execute(
+                "SELECT * FROM segments WHERE session_id = ? ORDER BY start_off, end_off",
+                (session_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def insert_segments_with_bitmap(self, session_id: str, records: list[dict], bitmap: bytes) -> None:
+        """Record committed byte segments and flip newly covered bitmap bits atomically."""
+        with self.lock, self._conn:
+            for rec in records:
+                self._conn.execute(
+                    "INSERT INTO segments (session_id, seg_id, start_off, end_off, size,"
+                    " sha256, path, received_at)"
+                    " VALUES (:session_id, :seg_id, :start_off, :end_off, :size,"
+                    " :sha256, :path, :received_at)",
+                    rec,
+                )
+            self._conn.execute(
+                "UPDATE sessions SET bitmap = ? WHERE session_id = ?",
+                (bitmap, session_id),
+            )
+
+    def delete_segment(self, session_id: str, seg_id: str) -> None:
+        with self.lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM segments WHERE session_id = ? AND seg_id = ?",
+                (session_id, seg_id),
             )
 
     def mark_completed(self, session_id: str, completed_at: str, final_sha256: str, artifact_path: str) -> None:

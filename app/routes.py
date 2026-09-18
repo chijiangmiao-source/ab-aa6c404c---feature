@@ -30,6 +30,18 @@ def build_router(service: UploadService) -> APIRouter:
         )
         return JSONResponse(status_code=status_code, content=body)
 
+    @router.put("/sessions/{session_id}/ranges")
+    async def upload_range(
+        session_id: str,
+        request: Request,
+        content_range: str = Header(...),
+        x_range_sha256: str = Header(...),
+    ) -> JSONResponse:
+        body, status_code = await service.upload_range(
+            session_id, content_range, x_range_sha256, request.stream()
+        )
+        return JSONResponse(status_code=status_code, content=body)
+
     @router.post("/sessions/{session_id}/finalize")
     def finalize(session_id: str) -> dict:
         return service.finalize(session_id)
