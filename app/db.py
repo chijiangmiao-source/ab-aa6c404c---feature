@@ -1,4 +1,11 @@
-"""SQLite persistence: sessions (with received bitmap) and per-chunk digests."""
+"""SQLite persistence: sessions (with received bitmap), chunks and segments.
+
+The ``ranges`` table backs arbitrary byte-range uploads. The bitmap on the
+``sessions`` table is always kept equal to "logical chunks fully covered by
+the union of confirmed chunks and segments"; on databases created before
+range support existed it is rebuilt from the chunks table at startup (see
+``reconcile``), so old volumes migrate without rewriting any bodies.
+"""
 
 from __future__ import annotations
 
@@ -31,7 +38,21 @@ CREATE TABLE IF NOT EXISTS chunks (
     PRIMARY KEY (session_id, chunk_index),
     FOREIGN KEY (session_id) REFERENCES sessions (session_id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS ranges (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    start_off   INTEGER NOT NULL,
+    end_off     INTEGER NOT NULL,
+    sha256      TEXT NOT NULL,
+    path        TEXT NOT NULL,
+    size        INTEGER NOT NULL,
+    received_at TEXT NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions (session_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_ranges_session ON ranges (session_id, start_off);
 """
+
+_USER_VERSION = 2
 
 
 class Database:
@@ -47,6 +68,9 @@ class Database:
             self._conn.execute("PRAGMA synchronous=FULL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(SCHEMA)
+            version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            if version < _USER_VERSION:
+                self._conn.execute(f"PRAGMA user_version = {_USER_VERSION}")
             self._conn.commit()
 
     def create_session(self, rec: dict) -> None:
@@ -112,6 +136,32 @@ class Database:
             self._conn.execute(
                 "UPDATE sessions SET bitmap = ? WHERE session_id = ?", (bitmap, session_id)
             )
+
+    # ---- segments backing arbitrary byte ranges ----
+
+    def list_ranges(self, session_id: str) -> list[dict]:
+        with self.lock:
+            rows = self._conn.execute(
+                "SELECT * FROM ranges WHERE session_id = ? ORDER BY start_off, end_off",
+                (session_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def commit_segments(self, session_id: str, records: list[dict], bitmap: bytes) -> None:
+        """Atomically publish one request's new segment files and the new bitmap."""
+        with self.lock, self._conn:
+            self._conn.executemany(
+                "INSERT INTO ranges (session_id, start_off, end_off, sha256, path, size, received_at)"
+                " VALUES (:session_id, :start_off, :end_off, :sha256, :path, :size, :received_at)",
+                records,
+            )
+            self._conn.execute(
+                "UPDATE sessions SET bitmap = ? WHERE session_id = ?", (bitmap, session_id)
+            )
+
+    def delete_range(self, range_id: int) -> None:
+        with self.lock, self._conn:
+            self._conn.execute("DELETE FROM ranges WHERE id = ?", (range_id,))
 
     def mark_completed(self, session_id: str, completed_at: str, final_sha256: str, artifact_path: str) -> None:
         with self.lock, self._conn:
